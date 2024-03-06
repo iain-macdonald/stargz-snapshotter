@@ -37,7 +37,6 @@ import (
 	fusefs "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	digest "github.com/opencontainers/go-digest"
-	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -124,6 +123,8 @@ func (lh *layerReleasable) release() {
 	lh.mu.Unlock()
 }
 
+// Note: Inodes are briefly considered "forgotten" after creation. Care must be
+// taken to avoid races between creation and forgotten-checks.
 func isForgotten(n *fusefs.Inode) bool {
 	if !n.Forgotten() {
 		return false
@@ -592,36 +593,19 @@ func defaultLinkAttr(out *fuse.Attr) fusefs.StableAttr {
 
 // idMap manages uint32 IDs with automatic GC for releasable objects.
 type idMap struct {
-	m        map[uint32]releasable
-	max      uint32
-	mu       sync.Mutex
-	cleanupG singleflight.Group
+	m    map[uint32]releasable
+	prev uint32
+	mu   sync.Mutex
 }
 
 type releasable interface {
 	releasable() bool
 }
 
-// add reserves an unique uint32 object for the provided releasable object.
-// when that object become releasable, that ID will be reused for other objects.
+// Reserves a unique uint32 object for the provided releasable object. uint32s
+// will be reused only when the previous claimer is releasable and the entire
+// id space has been exhausted.
 func (m *idMap) add(p func(uint32) (releasable, error)) error {
-	m.cleanupG.Do("cleanup", func() (interface{}, error) {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		max := uint32(0)
-		for i := uint32(0); i <= m.max; i++ {
-			if e, ok := m.m[i]; ok {
-				if e.releasable() {
-					delete(m.m, i)
-				} else {
-					max = i
-				}
-			}
-		}
-		m.max = max
-		return nil, nil
-	})
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -629,7 +613,7 @@ func (m *idMap) add(p func(uint32) (releasable, error)) error {
 		m.m = make(map[uint32]releasable)
 	}
 
-	for i := uint32(0); i <= ^uint32(0); i++ {
+	for i := m.prev + 1; i != m.prev; i++ {
 		if i == 0 {
 			continue
 		}
@@ -639,9 +623,7 @@ func (m *idMap) add(p func(uint32) (releasable, error)) error {
 			if err != nil {
 				return err
 			}
-			if m.max < i {
-				m.max = i
-			}
+			m.prev = i
 			m.m[i] = r
 			return nil
 		}
